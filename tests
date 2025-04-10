@@ -1,0 +1,10 @@
+import unittest
+from src.anfis_model import ANFIS
+
+class TestANFIS(unittest.TestCase):
+    def test_model_initialization(self):
+        model = ANFIS(n_inputs=2, n_rules=5)
+        self.assertEqual(model.mu.shape, (2, 5))
+
+if __name__ == "__main__":
+    unittest.main()
