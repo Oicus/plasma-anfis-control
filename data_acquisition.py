@@ -1,90 +1,94 @@
-from pymodbus.client import AsyncModbusTcpClient
-from pymodbus.exceptions import ModbusIOException, ConnectionException
-import pandas as pd
 import asyncio
 import time
-from contextlib import asynccontextmanager
+import uuid
+import logging
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pymodbus.client import AsyncModbusTcpClient
+from pymodbus.exceptions import ModbusException
 
 class PlasmaDataCollector:
-    def __init__(self, ip="192.168.1.10", sample_rate=100):
+    def __init__(self, ip="192.168.1.10", sample_rate=100, buffer_size=5000):
         self.ip = ip
+        self.sample_rate = sample_rate
+        self.buffer_size = buffer_size
         self._client = None
-        self._sample_interval = 1 / sample_rate  # örnekleme aralığı (saniye)
         self._buffer = []
         self._buffer_lock = asyncio.Lock()
+        self._logger = logging.getLogger(self.__class__.__name__)
+        self._running = False
 
-    @property
-    async def client(self):
-        # Otomatik bağlantı kontrolü
-        if not self._client or not self._client.connected:
-            self._client = AsyncModbusTcpClient(self.ip)
-            await self._client.connect()
-        return self._client
-
-    async def _reset_connection(self):
-        if self._client:
-            await self._client.close()
+    async def connect(self):
         self._client = AsyncModbusTcpClient(self.ip)
         await self._client.connect()
+        self._running = True
 
-    async def _read_sensors(self):
-        client = await self.client
+    async def disconnect(self):
+        self._running = False
+        if self._client:
+            await self._client.close()
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.flush()
+        await self.disconnect()
+
+    async def _read_batch(self):
         try:
-            # Aynı anda sıcaklık ve gamma ölçümleri alınır
-            temp, gamma = await asyncio.gather(
-                client.read_holding_registers(0, 1, unit=1),
-                client.read_input_registers(1, 1, unit=1)
-            )
-            return (
-                temp.registers[0] * 0.1,  # 10 tabanlı hassasiyet çarpanı
-                gamma.registers[0]
-            )
-        except (ModbusIOException, ConnectionException) as e:
-            print(f"[ERROR] Modbus read failed: {e}")
-            await self._reset_connection()
-            return None, None
-        except Exception as e:
-            print(f"[ERROR] Unknown exception: {e}")
+            rr = await self._client.read_holding_registers(0, 2, unit=1)
+            if rr.isError():
+                raise ModbusException(rr)
+            return rr.registers[0] * 0.1, rr.registers[1]
+        except ModbusException as e:
+            self._logger.error(f"Read error: {e}")
+            await self._reconnect()
             return None, None
 
-    async def _data_writer(self):
-        while True:
-            async with self._buffer_lock:
-                if len(self._buffer) >= 5000:
-                    df = pd.DataFrame(self._buffer, columns=["timestamp", "plasma_temp", "gamma_flux"])
-                    df.to_parquet(f"data/plasma_{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}.parquet")
-                    self._buffer.clear()
-            await asyncio.sleep(1)
+    async def _reconnect(self):
+        await self.disconnect()
+        await asyncio.sleep(1)
+        await self.connect()
 
-    async def collect(self, duration=3600):
-        start_time = time.monotonic()
-        writer_task = asyncio.create_task(self._data_writer())
-
-        try:
-            while (time.monotonic() - start_time) < duration:
-                loop_start = time.perf_counter()
-
-                temp, gamma = await self._read_sensors()
-                if temp is None:
-                    continue  # veri geçersizse tekrar dene
-
-                timestamp = pd.Timestamp.now().tz_localize('UTC')
-
-                async with self._buffer_lock:
-                    self._buffer.append([timestamp, temp, gamma])
-
-                elapsed = time.perf_counter() - loop_start
-                await asyncio.sleep(max(0, self._sample_interval - elapsed))
-
-        except Exception as e:
-            print(f"[CRITICAL] Collection loop interrupted: {e}")
-        finally:
-            writer_task.cancel()
-
-        # Kalan verileri yaz
+    async def flush(self):
         async with self._buffer_lock:
             if self._buffer:
-                df = pd.DataFrame(self._buffer, columns=["timestamp", "plasma_temp", "gamma_flux"])
-                df.to_parquet(f"data/plasma_final_{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}.parquet")
-                return df
+                await self._write_buffer()
 
+    async def _write_buffer(self):
+        table = pa.Table.from_pydict({
+            "timestamp": [x[0] for x in self._buffer],
+            "plasma_temp": [x[1] for x in self._buffer],
+            "gamma_flux": [x[2] for x in self._buffer]
+        })
+        
+        filename = f"data/plasma_{uuid.uuid4().hex}.parquet"
+        try:
+            pq.write_table(table, filename)
+            self._logger.info(f"Wrote {len(self._buffer)} records to {filename}")
+        except Exception as e:
+            self._logger.error(f"Write failed: {e}")
+
+    async def collect(self):
+        expected_interval = 1.0 / self.sample_rate
+        while self._running:
+            start_time = time.perf_counter()
+            
+            temp, gamma = await self._read_batch()
+            if temp is None:
+                continue
+                
+            timestamp = pa.timestamp('us').cast(time.time_ns() // 1000)
+            
+            async with self._buffer_lock:
+                self._buffer.append((timestamp, temp, gamma))
+                if len(self._buffer) >= self.buffer_size:
+                    await self._write_buffer()
+                    self._buffer.clear()
+
+            # Adaptif uyku süresi
+            elapsed = time.perf_counter() - start_time
+            sleep_time = max(0, expected_interval - elapsed)
+            await asyncio.sleep(sleep_time)
